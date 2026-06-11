@@ -1448,6 +1448,13 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 				Header:    req.Header,
 			}
 			if jreq.IsCall() {
+				if _, ok := calls[jreq.ID]; ok {
+					writeJSONRPCError(w, http.StatusBadRequest, jreq.ID, &jsonrpc.Error{
+						Code:    jsonrpc.CodeInvalidRequest,
+						Message: fmt.Sprintf("duplicate request ID %v in batch", jreq.ID.Raw()),
+					})
+					return
+				}
 				calls[jreq.ID] = struct{}{}
 				// See the doc for CloseSSEStream: allow the request handler to
 				// explicitly close the ongoing stream.
@@ -1528,6 +1535,37 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	// Register the stream, rejecting requests whose ID is already in flight.
+	//
+	// The check and registration must be atomic: if two concurrent POSTs carry
+	// the same request ID, the second registration would otherwise overwrite
+	// the first in c.requestStreams, causing the response to the first request
+	// to be delivered to the second request's HTTP response (and the first to
+	// hang forever). Entries in c.requestStreams are deleted when their
+	// response is delivered, so sequential reuse of request IDs is unaffected.
+	//
+	// This must also happen before any response data is written below (such as
+	// the priming event), so that we can still reject the request with an HTTP
+	// error. Registering before the stream is claimed (stream.w is set) is
+	// safe, because messages are only routed to the stream after its requests
+	// are published to c.incoming.
+	c.mu.Lock()
+	for reqID := range calls {
+		if _, ok := c.requestStreams[reqID]; ok {
+			c.mu.Unlock()
+			writeJSONRPCError(w, http.StatusBadRequest, reqID, &jsonrpc.Error{
+				Code:    jsonrpc.CodeInvalidRequest,
+				Message: fmt.Sprintf("request ID %v is already in flight for this session", reqID.Raw()),
+			})
+			return
+		}
+	}
+	c.streams[stream.id] = stream
+	for reqID := range calls {
+		c.requestStreams[reqID] = stream.id
+	}
+	c.mu.Unlock()
+
 	// Set response headers. Accept was checked in [StreamableHTTPHandler].
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	if c.jsonResponse {
@@ -1578,14 +1616,6 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 	defer stream.release()
 
 	// The stream is now set up to deliver messages.
-	//
-	// Register it before publishing incoming messages.
-	c.mu.Lock()
-	c.streams[stream.id] = stream
-	for reqID := range calls {
-		c.requestStreams[reqID] = stream.id
-	}
-	c.mu.Unlock()
 
 	// Publish incoming messages.
 	for _, msg := range incoming {

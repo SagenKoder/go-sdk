@@ -1584,6 +1584,236 @@ func mustMarshal(v any) json.RawMessage {
 	return data
 }
 
+// TestStreamableServerTransportDuplicateID verifies that the server transport
+// rejects a POST carrying a JSON-RPC request ID that is already in flight on
+// the same session.
+//
+// Without this guard, the second POST overwrites the response routing of the
+// first (c.requestStreams is keyed by request ID), so the response to the
+// first request is delivered to the second request's HTTP response, and the
+// first request hangs forever.
+func TestStreamableServerTransportDuplicateID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	transport := &StreamableServerTransport{SessionID: "dup-id-session"}
+	conn, err := transport.Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect() failed: %v", err)
+	}
+	defer conn.Close()
+
+	httpServer := httptest.NewServer(transport)
+	defer httpServer.Close()
+
+	// post sends a single message in a POST request, and asynchronously
+	// returns its result.
+	type postResult struct {
+		status   int
+		messages []jsonrpc.Message
+		body     string
+		err      error
+	}
+	post := func(msg jsonrpc.Message) <-chan postResult {
+		ch := make(chan postResult, 1)
+		go func() {
+			out := make(chan jsonrpc.Message)
+			var msgs []jsonrpc.Message
+			collected := make(chan struct{})
+			go func() {
+				defer close(collected)
+				for m := range out {
+					msgs = append(msgs, m)
+				}
+			}()
+			sreq := streamableRequest{method: "POST", messages: []jsonrpc.Message{msg}}
+			_, status, body, err := sreq.do(ctx, httpServer.URL, "dup-id-session", out)
+			<-collected
+			ch <- postResult{status, msgs, string(body), err}
+		}()
+		return ch
+	}
+
+	// Forward messages read from the server side of the connection, playing
+	// the role of the jsonrpc2 layer.
+	reads := make(chan jsonrpc.Message)
+	go func() {
+		for {
+			msg, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			reads <- msg
+		}
+	}()
+
+	// Send the first request, and wait for it to be published: by the time it
+	// is received from conn.Read, its response routing must be registered.
+	first := post(req(42, "tools/call", &CallToolParams{Name: "slow"}))
+	<-reads
+
+	// While the first request is still in flight, send a second request with
+	// the same ID.
+	second := post(req(42, "tools/call", &CallToolParams{Name: "fast"}))
+
+	// The duplicate must be rejected before it is published; otherwise its
+	// stream registration overwrites that of the first request.
+	var rejection postResult
+	select {
+	case <-reads:
+		// The duplicate was accepted and published. Demonstrate the resulting
+		// misrouting: the response to the first request is delivered to the
+		// second request's POST.
+		t.Errorf("duplicate in-flight request ID was published rather than rejected")
+		if err := conn.Write(ctx, resp(42, &CallToolResult{Content: []Content{}}, nil)); err != nil {
+			t.Fatalf("Write() failed: %v", err)
+		}
+		res := <-second
+		t.Fatalf("after duplicate accepted, second POST got status %d, messages %v (sibling's response misrouted)", res.status, res.messages)
+	case rejection = <-second:
+	}
+	if rejection.err != nil {
+		t.Fatalf("second POST failed: %v", rejection.err)
+	}
+	if rejection.status != http.StatusBadRequest {
+		t.Errorf("second POST: got status %d, want %d", rejection.status, http.StatusBadRequest)
+	}
+
+	// The first request must be unaffected: its response is still delivered
+	// to the first POST.
+	if err := conn.Write(ctx, resp(42, &CallToolResult{Content: []Content{}}, nil)); err != nil {
+		t.Fatalf("Write() failed: %v", err)
+	}
+	res := <-first
+	if res.err != nil {
+		t.Fatalf("first POST failed: %v", res.err)
+	}
+	if res.status != http.StatusOK {
+		t.Errorf("first POST: got status %d, want %d", res.status, http.StatusOK)
+	}
+	want := []jsonrpc.Message{resp(42, &CallToolResult{Content: []Content{}}, nil)}
+	transform := cmpopts.AcyclicTransformer("jsonrpcid", func(id jsonrpc.ID) any { return id.Raw() })
+	if diff := cmp.Diff(want, res.messages, transform); diff != "" {
+		t.Errorf("first POST: unexpected messages (-want +got):\n%s", diff)
+	}
+}
+
+// TestStreamableDuplicateRequestID is the end-to-end counterpart of
+// [TestStreamableServerTransportDuplicateID]: a duplicate in-flight request
+// ID on a session is rejected with HTTP 400 without disturbing the original
+// request, and sequential reuse of a request ID remains allowed.
+func TestStreamableDuplicateRequestID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	slowStarted := make(chan struct{})
+	slowRelease := make(chan struct{})
+	server := NewServer(&Implementation{Name: "testServer", Version: "v1.0.0"}, nil)
+	server.AddTool(
+		&Tool{Name: "slow", InputSchema: &jsonschema.Schema{Type: "object"}},
+		func(ctx context.Context, req *CallToolRequest) (*CallToolResult, error) {
+			close(slowStarted)
+			select {
+			case <-slowRelease:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return &CallToolResult{Content: []Content{&TextContent{Text: "slow result"}}}, nil
+		})
+	server.AddTool(
+		&Tool{Name: "fast", InputSchema: &jsonschema.Schema{Type: "object"}},
+		func(ctx context.Context, req *CallToolRequest) (*CallToolResult, error) {
+			return &CallToolResult{Content: []Content{&TextContent{Text: "fast result"}}}, nil
+		})
+
+	handler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, nil)
+	defer handler.closeAll()
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	// post sends a single message and synchronously returns its result.
+	post := func(sessionID string, msg jsonrpc.Message) (string, int, []jsonrpc.Message, string, error) {
+		out := make(chan jsonrpc.Message)
+		var msgs []jsonrpc.Message
+		collected := make(chan struct{})
+		go func() {
+			defer close(collected)
+			for m := range out {
+				msgs = append(msgs, m)
+			}
+		}()
+		sreq := streamableRequest{method: "POST", messages: []jsonrpc.Message{msg}}
+		gotSessionID, status, body, err := sreq.do(ctx, httpServer.URL, sessionID, out)
+		<-collected
+		return gotSessionID, status, msgs, string(body), err
+	}
+
+	// Initialize the session.
+	sessionID, status, _, _, err := post("", req(1, methodInitialize, &InitializeParams{ProtocolVersion: protocolVersion20250618}))
+	if err != nil {
+		t.Fatalf("initialize failed: %v", err)
+	}
+	if status != http.StatusOK || sessionID == "" {
+		t.Fatalf("initialize: got status %d, session ID %q", status, sessionID)
+	}
+	if _, status, _, _, err := post(sessionID, req(0, notificationInitialized, &InitializedParams{})); err != nil || status != http.StatusAccepted {
+		t.Fatalf("initialized: got status %d, err %v", status, err)
+	}
+
+	// Issue a slow tool call with ID 2, and wait for it to be in flight.
+	type postResult struct {
+		status   int
+		messages []jsonrpc.Message
+		err      error
+	}
+	first := make(chan postResult, 1)
+	go func() {
+		_, status, msgs, _, err := post(sessionID, req(2, "tools/call", &CallToolParams{Name: "slow"}))
+		first <- postResult{status, msgs, err}
+	}()
+	select {
+	case <-slowStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for slow tool call to start")
+	}
+
+	// A concurrent call reusing the in-flight ID 2 must be rejected, not
+	// silently dropped or cross-wired with the slow call.
+	_, status, _, body, err := post(sessionID, req(2, "tools/call", &CallToolParams{Name: "fast"}))
+	if err != nil {
+		t.Fatalf("duplicate call failed: %v", err)
+	}
+	if status != http.StatusBadRequest {
+		t.Errorf("duplicate in-flight call: got status %d, want %d (body: %s)", status, http.StatusBadRequest, body)
+	}
+
+	// The slow call must complete with its own result.
+	close(slowRelease)
+	res := <-first
+	if res.err != nil {
+		t.Fatalf("slow call failed: %v", res.err)
+	}
+	if res.status != http.StatusOK {
+		t.Errorf("slow call: got status %d, want %d", res.status, http.StatusOK)
+	}
+	if len(res.messages) != 1 || !strings.Contains(string(mustMarshal(res.messages[0])), "slow result") {
+		t.Errorf("slow call: got messages %v, want a single response containing %q", res.messages, "slow result")
+	}
+
+	// Sequential reuse of ID 2 is allowed: the previous request with this ID
+	// has completed.
+	_, status, msgs, _, err := post(sessionID, req(2, "tools/call", &CallToolParams{Name: "fast"}))
+	if err != nil {
+		t.Fatalf("sequential reuse call failed: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("sequential reuse: got status %d, want %d", status, http.StatusOK)
+	}
+	if len(msgs) != 1 || !strings.Contains(string(mustMarshal(msgs[0])), "fast result") {
+		t.Errorf("sequential reuse: got messages %v, want a single response containing %q", msgs, "fast result")
+	}
+}
+
 func TestEventID(t *testing.T) {
 	tests := []struct {
 		sid string
